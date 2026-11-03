@@ -1,5 +1,5 @@
 """
-Ард-ын Telegram сувгуудын шинэ постыг (текст + зураг) таны группт
+Ард-ын Telegram сувгуудын шинэ постыг (текст, зураг, видео) таны группт
 автоматаар оруулдаг бот.
 
 Хэрхэн ажилладаг вэ:
@@ -36,13 +36,15 @@ CHECK_INTERVAL = 300  # байнга ажиллах горимд хэдэн се
 STATE_FILE = "ard_bot_state.json"  # аль постыг илгээснийг санах файл
 MAX_TEXT = 3500      # энгийн мессежийн хязгаар (Telegram: 4096)
 MAX_CAPTION = 1024   # зурагны тайлбарын хязгаар (Telegram: 1024)
-MAX_PHOTOS = 10      # нэг удаа илгээх зургийн дээд тоо (Telegram: 10)
+MAX_MEDIA = 10       # нэг удаа илгээх зураг/видеоны дээд тоо (Telegram: 10)
+DEDUP_KEEP = 300     # давхардал шалгахад сүүлийн хэдэн постыг санах вэ
+MAX_FILE_MB = 49     # ботоор илгээх файлын хэмжээний хязгаар (Telegram: 50MB)
 # ==================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ard_bot")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ArdForwardBot/1.1)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ArdForwardBot/1.2)"}
 API = "https://api.telegram.org/bot{token}/{method}"
 BG_URL = re.compile(r"background-image:\s*url\(['\"]?(.*?)['\"]?\)")
 
@@ -65,7 +67,7 @@ def save_state(state):
 
 # ---------- Сувгаас унших ----------
 def parse_posts(html_text):
-    """Сувгийн вэб хуудаснаас (пост_дугаар, текст, [зургийн_линкүүд]) гаргана."""
+    """Сувгийн вэб хуудаснаас (пост_дугаар, текст, [(төрөл, линк), ...]) гаргана."""
     soup = BeautifulSoup(html_text, "html.parser")
     posts = []
     for msg in soup.select("div.tgme_widget_message[data-post]"):
@@ -73,16 +75,27 @@ def parse_posts(html_text):
             post_id = int(msg["data-post"].split("/")[-1])
         except (ValueError, KeyError):
             continue
+
+        text = ""
         text_el = msg.select_one(".tgme_widget_message_text")
-        text = text_el.get_text("\n", strip=True) if text_el else ""
+        if text_el:
+            # <br>-ийг шинэ мөр болгоод, эможи бүрийг тусдаа мөрөнд гаргахгүй
+            for br in text_el.find_all("br"):
+                br.replace_with("\n")
+            text = text_el.get_text().strip()
 
-        photos = []
-        for a in msg.select("a.tgme_widget_message_photo_wrap"):
-            m = BG_URL.search(a.get("style", ""))
-            if m and m.group(1) not in photos:
-                photos.append(m.group(1))
+        media, seen = [], set()
+        for el in msg.select("a.tgme_widget_message_photo_wrap, video.tgme_widget_message_video"):
+            if el.name == "video":
+                url, kind = el.get("src"), "video"
+            else:
+                m = BG_URL.search(el.get("style", ""))
+                url, kind = (m.group(1) if m else None), "photo"
+            if url and url not in seen:
+                seen.add(url)
+                media.append((kind, url))
 
-        posts.append((post_id, text, photos))
+        posts.append((post_id, text, media))
     posts.sort(key=lambda p: p[0])
     return posts
 
@@ -94,8 +107,10 @@ def fetch_posts(channel):
 
 
 def download(url):
-    r = requests.get(url, headers=HEADERS, timeout=60)
+    r = requests.get(url, headers=HEADERS, timeout=120)
     r.raise_for_status()
+    if len(r.content) > MAX_FILE_MB * 1024 * 1024:
+        raise ValueError(f"{MAX_FILE_MB}MB-аас том файл")
     return r.content
 
 
@@ -135,35 +150,40 @@ def send_text(text):
     return tg_call("sendMessage", {"chat_id": CHAT_ID, "text": text})
 
 
-def send_post(channel, post_id, text, photo_urls):
+def send_post(channel, post_id, text, media_items):
     message = format_post(channel, post_id, text)
 
-    images = []
-    for url in photo_urls[:MAX_PHOTOS]:
+    files_ok = []  # [(төрөл, байт), ...]
+    for kind, url in media_items[:MAX_MEDIA]:
         try:
-            images.append(download(url))
+            files_ok.append((kind, download(url)))
         except Exception as e:
-            log.warning("Зураг татаж чадсангүй (%s): %s", url, e)
+            log.warning("%s татаж чадсангүй (%s): %s", kind, url, e)
 
-    # Зураггүй пост → энгийн текст
-    if not images:
+    # Зураг/видеогүй пост → энгийн текст
+    if not files_ok:
         return send_text(message)
 
     caption_fits = len(message) <= MAX_CAPTION
+    ext = {"photo": "jpg", "video": "mp4"}
 
-    if len(images) == 1:
+    if len(files_ok) == 1:
+        kind, blob = files_ok[0]
         data = {"chat_id": CHAT_ID}
         if caption_fits:
             data["caption"] = message
-        ok = tg_call("sendPhoto", data, files={"photo": ("photo.jpg", images[0])})
+        if kind == "video":
+            data["supports_streaming"] = "true"
+        method = "sendVideo" if kind == "video" else "sendPhoto"
+        ok = tg_call(method, data, files={kind: (f"file.{ext[kind]}", blob)})
     else:
         media, files = [], {}
-        for i, img in enumerate(images):
-            item = {"type": "photo", "media": f"attach://p{i}"}
+        for i, (kind, blob) in enumerate(files_ok):
+            item = {"type": kind, "media": f"attach://m{i}"}
             if i == 0 and caption_fits:
                 item["caption"] = message
             media.append(item)
-            files[f"p{i}"] = (f"p{i}.jpg", img)
+            files[f"m{i}"] = (f"m{i}.{ext[kind]}", blob)
         ok = tg_call("sendMediaGroup",
                      {"chat_id": CHAT_ID, "media": json.dumps(media, ensure_ascii=False)},
                      files=files)
@@ -171,12 +191,20 @@ def send_post(channel, post_id, text, photo_urls):
     if not ok:
         return False
 
-    # Текст урт бол зургийн дараа тусад нь илгээнэ
+    # Текст урт бол зураг/видеоны дараа тусад нь илгээнэ
     if not caption_fits:
         time.sleep(1)
         if not send_text(message):
-            log.warning("Зураг явсан ч текст явсангүй (#%s)", post_id)
+            log.warning("Медиа явсан ч текст явсангүй (#%s)", post_id)
     return True
+
+
+# ---------- Давхардал шалгах ----------
+def text_key(text):
+    """Постын текстээс линк, эможи, тэмдэгтийг хасаад харьцуулах түлхүүр гаргана."""
+    t = re.sub(r"https?://\S+|t\.me/\S+|@\w+", " ", text.lower())
+    t = "".join(ch for ch in t if ch.isalnum())
+    return t[:300] if len(t) >= 20 else ""  # хэт богино текстийг харьцуулахгүй
 
 
 # ---------- Гол логик ----------
@@ -196,12 +224,22 @@ def check_channel(channel, state):
         log.info("%s: эхлүүллээ (сүүлийн пост #%s)", channel, newest)
         return
 
-    for post_id, text, photos in posts:
+    seen = state.setdefault("_seen", [])
+    for post_id, text, media in posts:
         if post_id <= last_seen:
             continue
-        if send_post(channel, post_id, text, photos):
-            log.info("%s: #%s илгээлээ (%d зураг)", channel, post_id, len(photos))
+        key = text_key(text)
+        if key and key in seen:
+            log.info("%s: #%s давхардсан тул алгаслаа", channel, post_id)
             state[channel] = post_id
+            save_state(state)
+            continue
+        if send_post(channel, post_id, text, media):
+            log.info("%s: #%s илгээлээ (%d зураг/видео)", channel, post_id, len(media))
+            state[channel] = post_id
+            if key:
+                seen.append(key)
+                del seen[:-DEDUP_KEEP]
             save_state(state)
             time.sleep(2)
         else:
