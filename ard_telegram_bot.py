@@ -30,7 +30,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
 # Дагах сувгууд (t.me/ дараах нэр). Хүссэнээрээ нэмж, хасаж болно.
-CHANNELS = ["ardappofficial", "ardcoin"]
+CHANNELS = ["ardappofficial", "ardcoin", "ArdLife"]
 
 CHECK_INTERVAL = 300  # байнга ажиллах горимд хэдэн секунд тутамд шалгах
 STATE_FILE = "ard_bot_state.json"  # аль постыг илгээснийг санах файл
